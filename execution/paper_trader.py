@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from threading import RLock
 from uuid import uuid4
 
 from core.logger import get_logger
-from db.models import PnLResponseModel, PnLSnapshotModel, PortfolioModel, PositionModel, TradeModel
+from db.models import (
+    DailyInvestmentRecordModel,
+    PnLResponseModel,
+    PnLSnapshotModel,
+    PortfolioModel,
+    PositionModel,
+    TradeModel,
+)
 from db.persistence import PersistenceManager
 from state.store import TradingState
 
@@ -21,6 +28,8 @@ class Position:
     qty: int
     avg_price: float
     side: str = "LONG"
+    stop_loss: float | None = None
+    target_price: float | None = None
     realized_pnl: float = 0.0
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -36,16 +45,30 @@ class PaperTradingEngine:
     ) -> None:
         self.initial_capital = float(initial_capital)
         self.cash = float(initial_capital)
+        self.active_market = "US"
         self.positions: dict[str, Position] = {}
         self.state = state
         self.persistence = persistence
         self.lock = RLock()
         self.updated_at = datetime.now(timezone.utc)
+        self.session_started_at = self.updated_at
+        self.last_settlement_date: date | None = None
 
-    def place_order(self, ticker: str, price: float, signal: str, qty: int) -> TradeModel:
+    def place_order(
+        self,
+        ticker: str,
+        price: float,
+        signal: str,
+        qty: int,
+        *,
+        stop_loss: float | None = None,
+        target_price: float | None = None,
+    ) -> TradeModel:
         """Simulate a BUY or SELL order and update portfolio state."""
 
         side = signal.upper()
+        if side == "SHORT":
+            side = "SELL"
         now = datetime.now(timezone.utc)
 
         if qty <= 0:
@@ -63,9 +86,25 @@ class PaperTradingEngine:
 
         with self.lock:
             if side == "BUY":
-                return self._buy(ticker=ticker, price=price, qty=qty, signal=signal, now=now)
+                return self._buy(
+                    ticker=ticker,
+                    price=price,
+                    qty=qty,
+                    signal=signal,
+                    now=now,
+                    stop_loss=stop_loss,
+                    target_price=target_price,
+                )
             if side == "SELL":
-                return self._sell(ticker=ticker, price=price, qty=qty, signal=signal, now=now)
+                return self._sell(
+                    ticker=ticker,
+                    price=price,
+                    qty=qty,
+                    signal=signal,
+                    now=now,
+                    stop_loss=stop_loss,
+                    target_price=target_price,
+                )
             return self._build_trade(
                 ticker=ticker,
                 side="BUY",
@@ -81,6 +120,12 @@ class PaperTradingEngine:
     def calculate_pnl(self, current_prices: dict[str, float]) -> PnLResponseModel:
         """Calculate current and historical PnL using the latest market prices."""
 
+        snapshot = self.record_snapshot(current_prices)
+        return PnLResponseModel(current=snapshot, history=self.state.get_history())
+
+    def record_snapshot(self, current_prices: dict[str, float]) -> PnLSnapshotModel:
+        """Persist a mark-to-market snapshot for intraday charting."""
+
         portfolio = self.get_portfolio(current_prices)
         snapshot = PnLSnapshotModel(
             timestamp=datetime.now(timezone.utc),
@@ -90,10 +135,13 @@ class PaperTradingEngine:
             realized_pnl=portfolio.realized_pnl,
             unrealized_pnl=portfolio.unrealized_pnl,
         )
+        # Keep a truly fresh account clean until there is actual trading activity.
+        if not self.positions and not self.state.get_trades():
+            return snapshot
         self.state.add_snapshot(snapshot)
         if self.persistence:
-            self.persistence.save_snapshot(snapshot)
-        return PnLResponseModel(current=snapshot, history=self.state.get_history())
+            self.persistence.save_snapshot(self.active_market, snapshot)
+        return snapshot
 
     def get_portfolio(self, current_prices: dict[str, float] | None = None) -> PortfolioModel:
         """Return current portfolio state enriched with market values."""
@@ -106,7 +154,8 @@ class PaperTradingEngine:
             for trade in self.state.get_trades():
                 if trade.status == "FILLED":
                     latest_actions[trade.ticker] = trade.side
-                    realized_pnl += trade.realized_pnl
+                    if trade.timestamp >= self.session_started_at:
+                        realized_pnl += trade.realized_pnl
 
             positions: list[PositionModel] = []
             invested_value = 0.0
@@ -160,29 +209,98 @@ class PaperTradingEngine:
     def restore_state(
         self,
         *,
+        market: str,
+        initial_capital: float,
         cash: float,
         updated_at: datetime,
+        session_started_at: datetime,
+        last_settlement_date: date | None,
         positions: list[PositionModel],
     ) -> None:
         """Restore engine state from persistent storage."""
 
         with self.lock:
+            self.active_market = market
+            self.initial_capital = float(initial_capital)
             self.cash = cash
             self.updated_at = updated_at
+            self.session_started_at = session_started_at
+            self.last_settlement_date = last_settlement_date
             self.positions = {
                 position.ticker: Position(
                     ticker=position.ticker,
                     qty=position.qty,
                     avg_price=position.avg_price,
                     side=position.side,
+                    stop_loss=None,
+                    target_price=None,
                     realized_pnl=position.realized_pnl,
                     last_updated=position.last_updated,
                 )
                 for position in positions
             }
 
+    def settle_market_close(
+        self,
+        *,
+        session_date: date,
+        current_prices: dict[str, float],
+    ) -> DailyInvestmentRecordModel | None:
+        """Roll the closing portfolio value into next session capital once per market day."""
+
+        with self.lock:
+            if self.last_settlement_date == session_date:
+                return None
+
+            portfolio = self.get_portfolio(current_prices)
+            settled_at = datetime.now(timezone.utc)
+            ending_capital = portfolio.total_value
+            record = DailyInvestmentRecordModel(
+                session_date=session_date,
+                starting_capital=portfolio.initial_capital,
+                closing_cash=portfolio.cash,
+                closing_market_value=portfolio.market_value,
+                ending_capital=ending_capital,
+                realized_pnl=portfolio.realized_pnl,
+                unrealized_pnl=portfolio.unrealized_pnl,
+                net_pnl=ending_capital - portfolio.initial_capital,
+                positions_closed=len(portfolio.positions),
+                settled_at=settled_at,
+            )
+
+            self.positions = {}
+            self.cash = ending_capital
+            self.initial_capital = ending_capital
+            self.updated_at = settled_at
+            self.session_started_at = settled_at
+            self.last_settlement_date = session_date
+
+            if self.persistence:
+                self.persistence.save_daily_investment(self.active_market, record)
+                self.persistence.save_portfolio(
+                    self.active_market,
+                    self.get_portfolio(),
+                    session_started_at=self.session_started_at,
+                    last_settlement_date=self.last_settlement_date,
+                )
+
+            logger.info(
+                "Settled market close for %s with ending capital %.2f",
+                session_date.isoformat(),
+                ending_capital,
+            )
+            return record
+
     def _buy(
-        self, ticker: str, price: float, qty: int, signal: str, now: datetime
+        self,
+        ticker: str,
+        price: float,
+        qty: int,
+        signal: str,
+        now: datetime,
+        *,
+        stop_loss: float | None = None,
+        target_price: float | None = None,
     ) -> TradeModel:
         current = self.positions.get(ticker)
 
@@ -193,6 +311,8 @@ class PaperTradingEngine:
                 qty=qty,
                 signal=signal,
                 now=now,
+                stop_loss=stop_loss,
+                target_price=target_price,
             )
 
         cost = price * qty
@@ -213,6 +333,8 @@ class PaperTradingEngine:
             total_qty = current.qty + qty
             current.avg_price = ((current.avg_price * current.qty) + cost) / total_qty
             current.qty = total_qty
+            current.stop_loss = stop_loss if stop_loss is not None else current.stop_loss
+            current.target_price = target_price if target_price is not None else current.target_price
             current.last_updated = now
         else:
             self.positions[ticker] = Position(
@@ -221,6 +343,8 @@ class PaperTradingEngine:
                 avg_price=price,
                 side="LONG",
                 last_updated=now,
+                stop_loss=stop_loss,
+                target_price=target_price,
             )
 
         self.cash -= cost
@@ -239,7 +363,15 @@ class PaperTradingEngine:
         )
 
     def _sell(
-        self, ticker: str, price: float, qty: int, signal: str, now: datetime
+        self,
+        ticker: str,
+        price: float,
+        qty: int,
+        signal: str,
+        now: datetime,
+        *,
+        stop_loss: float | None = None,
+        target_price: float | None = None,
     ) -> TradeModel:
         current = self.positions.get(ticker)
         if current and current.side == "SHORT":
@@ -247,6 +379,8 @@ class PaperTradingEngine:
             total_qty = current.qty + qty
             current.avg_price = ((current.avg_price * current.qty) + proceeds) / total_qty
             current.qty = total_qty
+            current.stop_loss = stop_loss if stop_loss is not None else current.stop_loss
+            current.target_price = target_price if target_price is not None else current.target_price
             current.last_updated = now
             self.cash += proceeds
             self.updated_at = now
@@ -270,6 +404,8 @@ class PaperTradingEngine:
                 avg_price=price,
                 side="SHORT",
                 last_updated=now,
+                stop_loss=stop_loss,
+                target_price=target_price,
             )
             self.cash += qty * price
             self.updated_at = now
@@ -302,6 +438,8 @@ class PaperTradingEngine:
                     qty=reverse_qty,
                     avg_price=price,
                     side="SHORT",
+                    stop_loss=stop_loss,
+                    target_price=target_price,
                     last_updated=now,
                 )
         elif qty > sell_qty:
@@ -311,6 +449,8 @@ class PaperTradingEngine:
                 qty=reverse_qty,
                 avg_price=price,
                 side="SHORT",
+                stop_loss=stop_loss,
+                target_price=target_price,
                 realized_pnl=current.realized_pnl,
                 last_updated=now,
             )
@@ -330,7 +470,15 @@ class PaperTradingEngine:
         )
 
     def _cover_short(
-        self, ticker: str, price: float, qty: int, signal: str, now: datetime
+        self,
+        ticker: str,
+        price: float,
+        qty: int,
+        signal: str,
+        now: datetime,
+        *,
+        stop_loss: float | None = None,
+        target_price: float | None = None,
     ) -> TradeModel:
         current = self.positions[ticker]
         cover_qty = min(qty, current.qty)
@@ -349,6 +497,8 @@ class PaperTradingEngine:
                     qty=reverse_qty,
                     avg_price=price,
                     side="LONG",
+                    stop_loss=stop_loss,
+                    target_price=target_price,
                     last_updated=now,
                 )
         elif qty > cover_qty:
@@ -358,6 +508,8 @@ class PaperTradingEngine:
                 qty=reverse_qty,
                 avg_price=price,
                 side="LONG",
+                stop_loss=stop_loss,
+                target_price=target_price,
                 realized_pnl=current.realized_pnl,
                 last_updated=now,
             )
@@ -404,6 +556,11 @@ class PaperTradingEngine:
         )
         self.state.add_trade(trade)
         if self.persistence:
-            self.persistence.save_trade(trade)
-            self.persistence.save_portfolio(self.get_portfolio())
+            self.persistence.save_trade(self.active_market, trade)
+            self.persistence.save_portfolio(
+                self.active_market,
+                self.get_portfolio(),
+                session_started_at=self.session_started_at,
+                last_settlement_date=self.last_settlement_date,
+            )
         return trade

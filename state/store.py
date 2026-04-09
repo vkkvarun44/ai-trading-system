@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from threading import RLock
 
 from db.models import PnLSnapshotModel, SignalModel, TradeModel
@@ -35,6 +35,14 @@ class TradingState:
         with self.lock:
             return list(self.trades)
 
+    def get_trades_for_date(self, session_date: date) -> list[TradeModel]:
+        with self.lock:
+            return [
+                trade
+                for trade in self.trades
+                if trade.status == "FILLED" and trade.timestamp.date() == session_date
+            ]
+
     def load_trades(self, trades: list[TradeModel]) -> None:
         with self.lock:
             self.trades = list(trades)
@@ -60,3 +68,16 @@ class TradingState:
     def load_history(self, history: list[PnLSnapshotModel]) -> None:
         with self.lock:
             self.pnl_history = list(history)
+
+    def reset_for_market(
+        self,
+        *,
+        signals: list[SignalModel] | None = None,
+        trades: list[TradeModel] | None = None,
+        history: list[PnLSnapshotModel] | None = None,
+    ) -> None:
+        with self.lock:
+            self.latest_signals = list(signals or [])
+            self.trades = list(trades or [])
+            self.pnl_history = list(history or [])
+            self.cooldowns = {}

@@ -17,6 +17,11 @@ def momentum_rsi_strategy(indicators: dict[str, float], change_pct: float) -> st
         return "SELL"
 
     if rsi > 75:
-        return "AVOID"
+        if ema_9 < ema_21:
+            return "SELL"   # trend reversing
+        elif change_pct < 1:
+            return "SHORT"  # momentum dying
+        else:
+            return "HOLD"   # strong trend, don't fight
 
     return "HOLD"

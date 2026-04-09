@@ -6,7 +6,7 @@ from fastapi import APIRouter
 
 from app.dependencies import paper_engine, state
 from db.models import PnLResponseModel, PortfolioModel, TradeModel
-from market.yahoo_scanner import get_latest_prices
+from markets.yahoo_scanner import get_latest_prices
 
 router = APIRouter(tags=["trading"])
 
