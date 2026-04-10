@@ -52,13 +52,14 @@ class Settings:
     latest_prices_cache_seconds: int = int(os.getenv("LATEST_PRICES_CACHE_SECONDS", "15"))
     indicators_cache_seconds: int = int(os.getenv("INDICATORS_CACHE_SECONDS", "300"))
     signal_top_movers_limit: int = int(os.getenv("SIGNAL_TOP_MOVERS_LIMIT", "100"))
-    auto_watchlist_target_size: int = int(os.getenv("AUTO_WATCHLIST_TARGET_SIZE", "25"))
+    auto_watchlist_target_size: int = int(os.getenv("AUTO_WATCHLIST_TARGET_SIZE", "50"))
     auto_watchlist_min_price: float = float(os.getenv("AUTO_WATCHLIST_MIN_PRICE", "10"))
     auto_watchlist_min_avg_volume: float = float(os.getenv("AUTO_WATCHLIST_MIN_AVG_VOLUME", "200000"))
     auto_watchlist_refresh_seconds: int = int(os.getenv("AUTO_WATCHLIST_REFRESH_SECONDS", "60"))
     stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "0.05"))
     take_profit_pct: float = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))
     max_risk_per_trade: float = float(os.getenv("MAX_RISK_PER_TRADE", "0.01"))
+    daily_loss_limit_pct: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.03"))
     reward_ratio: float = float(os.getenv("REWARD_RATIO", "2.0"))       # 1:2 RR
     max_position_size: int = int(os.getenv("MAX_POSITION_SIZE", "500")) 
     min_volume_ratio: float = float(os.getenv("MIN_VOLUME_RATIO", "1.5"))
@@ -94,7 +95,12 @@ class Settings:
                     "RELIANCE.NS,TCS.NS,HDFCBANK.NS,ICICIBANK.NS,INFY.NS,SBIN.NS,"
                     "BHARTIARTL.NS,ITC.NS,LT.NS,AXISBANK.NS,KOTAKBANK.NS,HINDUNILVR.NS,"
                     "ASIANPAINT.NS,BAJFINANCE.NS,MARUTI.NS,SUNPHARMA.NS,TITAN.NS,"
-                    "ULTRACEMCO.NS,WIPRO.NS,POWERGRID.NS"
+                    "ULTRACEMCO.NS,WIPRO.NS,POWERGRID.NS,HCLTECH.NS,TECHM.NS,LTIM.NS,"
+                    "BAJAJFINSV.NS,HDFCLIFE.NS,SBILIFE.NS,ADANIENT.NS,ADANIPORTS.NS,"
+                    "ONGC.NS,NTPC.NS,COALINDIA.NS,BPCL.NS,IOC.NS,TATASTEEL.NS,JSWSTEEL.NS,"
+                    "HINDALCO.NS,GRASIM.NS,CIPLA.NS,DRREDDY.NS,DIVISLAB.NS,APOLLOHOSP.NS,"
+                    "NESTLEIND.NS,BRITANNIA.NS,TATACONSUM.NS,EICHERMOT.NS,HEROMOTOCO.NS,"
+                    "BAJAJ-AUTO.NS,M&M.NS,TATAMOTORS.NS,UPL.NS,SHREECEM.NS"
                 ),
             ).split(",")
             if ticker.strip()

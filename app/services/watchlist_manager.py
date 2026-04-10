@@ -43,6 +43,7 @@ class WatchlistManager:
                 prepared = self.build_watchlist(market).tickers
                 if not prepared:
                     prepared = self.prepare_watchlist(market, self._watchlists[market])[0]
+            prepared = self._ensure_target_size(market, prepared)
             self.set_watchlist(market, prepared)
             if not stored and prepared:
                 persistence.save_watchlist(market, prepared)
@@ -50,7 +51,10 @@ class WatchlistManager:
 
     def get_watchlist(self, market: str) -> list[str]:
         with self._lock:
-            return list(self._watchlists[market.upper()])
+            market_key = market.upper()
+            watchlist = self._ensure_target_size(market_key, self._watchlists[market_key])
+            self._watchlists[market_key] = watchlist
+            return list(watchlist)
 
     def get_last_refreshed_at(self, market: str) -> datetime | None:
         with self._lock:
@@ -108,12 +112,17 @@ class WatchlistManager:
             min_avg_volume=settings.auto_watchlist_min_avg_volume,
         )
         selected = candidates[:target]
+        selected_tickers = self._ensure_target_size(
+            market_key,
+            [candidate.ticker for candidate in selected],
+            target=target,
+        )
         return AutoWatchlistResponseModel(
             market=market_key,
             universe_size=len(universe),
             eligible_count=len(candidates),
             target_size=target,
-            tickers=[candidate.ticker for candidate in selected],
+            tickers=selected_tickers,
             candidates=selected,
         )
 
@@ -155,6 +164,34 @@ class WatchlistManager:
         if market == "INDIA":
             return get_india_market_universe()
         return get_us_market_universe()
+
+    def _ensure_target_size(
+        self,
+        market: str,
+        tickers: list[str],
+        *,
+        target: int | None = None,
+    ) -> list[str]:
+        """Top up short watchlists from configured defaults without duplicating symbols."""
+
+        market_key = market.upper()
+        desired_size = target or settings.auto_watchlist_target_size
+        prepared, _invalid = self.prepare_watchlist(market_key, tickers)
+        if len(prepared) >= desired_size:
+            return prepared
+
+        defaults = settings.india_watchlist if market_key == "INDIA" else settings.us_watchlist
+        fallback, _invalid = self.prepare_watchlist(market_key, defaults)
+        seen = set(prepared)
+        for ticker in fallback:
+            if ticker in seen:
+                continue
+            prepared.append(ticker)
+            seen.add(ticker)
+            if len(prepared) >= desired_size:
+                break
+
+        return prepared
 
     def _expand_tokens(self, raw_tickers: list[str]) -> list[str]:
         expanded: list[str] = []

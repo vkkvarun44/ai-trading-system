@@ -51,12 +51,15 @@ def apply_risk_management(
     if signal.atr <= 0:
         return RiskDecision(False, 0, 0.0, 0.0, 0.0, 0.0, "ATR is unavailable for sizing.")
 
+    required_rr = signal.strategy_reward_ratio or settings.reward_ratio
+    target_multiplier = settings.atr_stop_loss_multiplier * required_rr
+
     if signal.signal == "BUY":
         stop_loss = signal.price - (settings.atr_stop_loss_multiplier * signal.atr)
-        target_price = signal.price + (settings.atr_target_multiplier * signal.atr)
+        target_price = signal.price + (target_multiplier * signal.atr)
     elif signal.signal == "SELL":
         stop_loss = signal.price + (settings.atr_stop_loss_multiplier * signal.atr)
-        target_price = signal.price - (settings.atr_target_multiplier * signal.atr)
+        target_price = signal.price - (target_multiplier * signal.atr)
     else:
         return RiskDecision(False, 0, 0.0, 0.0, 0.0, 0.0, "Signal is not executable.")
 
@@ -66,9 +69,10 @@ def apply_risk_management(
         stop_loss=stop_loss,
         settings=settings,
     )
+    qty = int(qty * max(0.0, signal.position_size_multiplier))
     reward_amount = abs(target_price - signal.price)
     rr_ratio = reward_amount / abs(signal.price - stop_loss) if signal.price != stop_loss else 0.0
-    if rr_ratio < settings.reward_ratio:
+    if rr_ratio < required_rr:
         return RiskDecision(
             False,
             0,
@@ -76,7 +80,7 @@ def apply_risk_management(
             target_price,
             risk_amount,
             reward_amount,
-            f"Risk-reward ratio {rr_ratio:.2f} is below required {settings.reward_ratio:.2f}.",
+            f"Risk-reward ratio {rr_ratio:.2f} is below required {required_rr:.2f}.",
         )
     if qty <= 0:
         return RiskDecision(
@@ -101,9 +105,30 @@ def validate_trade(
 
     if signal.signal not in {"BUY", "SELL"}:
         return "Signal is not actionable."
-    if current_trade_count >= settings.max_trades_per_day:
-        return f"Daily trade limit reached ({settings.max_trades_per_day})."
+    if signal.regime_confidence and signal.regime_confidence < 0.6:
+        return (
+            f"Regime confidence too low for execution: {signal.regime} "
+            f"{signal.regime_confidence:.2f} < 0.60."
+        )
+    if signal.strategy_direction == "BUY" and signal.signal != "BUY":
+        return f"Regime {signal.regime} allows long trades only."
+    if signal.strategy_direction == "SELL" and signal.signal != "SELL":
+        return f"Regime {signal.regime} allows short trades only."
     return None
+
+
+def daily_loss_limit_reached(
+    *,
+    starting_capital: float,
+    current_equity: float,
+    settings: Settings,
+) -> bool:
+    """Return True when the intraday kill switch should stop new entries."""
+
+    if starting_capital <= 0:
+        return False
+    daily_loss = max(0.0, starting_capital - current_equity)
+    return daily_loss >= (starting_capital * settings.daily_loss_limit_pct)
 
 
 def get_session_trade_count(trades: list, *, timezone_name: str) -> int:

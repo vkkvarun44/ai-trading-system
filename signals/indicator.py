@@ -12,6 +12,7 @@ from ta.volatility import AverageTrueRange
 
 from core.config import settings
 from core.logger import get_logger
+from signals.market_regime import detect_latest_regime
 
 logger = get_logger(__name__)
 
@@ -130,6 +131,8 @@ def get_indicators(ticker: str) -> dict[str, float] | None:
     volume = df["Volume"]
 
     df = df.copy()
+    regime, regime_confidence, regime_row = detect_latest_regime(df)
+
     df["rsi"] = RSIIndicator(close=close, window=14).rsi()
     df["ema_9"] = EMAIndicator(close=close, window=9).ema_indicator()
     df["ema_21"] = EMAIndicator(close=close, window=21).ema_indicator()
@@ -162,6 +165,13 @@ def get_indicators(ticker: str) -> dict[str, float] | None:
         "volume_ratio": _as_float(latest["volume_ratio"]),
         "current_volume": _as_float(latest["Volume"]),
         "avg_volume_20": _as_float(latest["avg_volume_20"]),
+        "regime": regime,
+        "regime_confidence": float(regime_confidence),
     }
+    if regime_row is not None:
+        payload["ema_50_slope"] = _as_float(regime_row["ema_50_slope"])
+        payload["ema_200_slope"] = _as_float(regime_row["ema_200_slope"])
+        payload["volatility"] = _as_float(regime_row["volatility"])
+        payload["trend_strength"] = _as_float(regime_row["trend_strength"])
     _indicator_cache[ticker] = (datetime.now(timezone.utc), payload)
     return payload

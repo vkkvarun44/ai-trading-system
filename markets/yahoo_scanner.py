@@ -10,12 +10,24 @@ import yfinance as yf
 from core.config import settings
 from core.logger import get_logger
 from db.models import AutoWatchlistCandidateModel, MarketMover
+from signals.market_regime import (
+    FEATURE_COLUMNS,
+    REGIME_SIDEWAYS,
+    add_indicators,
+    create_features,
+    label_market,
+    predict_with_confidence,
+    train_model,
+)
 
 logger = get_logger(__name__)
 
 _price_cache: dict[str, tuple[datetime, float]] = {}
 _top_movers_cache: dict[str, tuple[datetime, dict[str, list[MarketMover]]]] = {}
+_ranked_candidates_cache: dict[str, tuple[datetime, list[AutoWatchlistCandidateModel]]] = {}
 _rate_limited_until: datetime | None = None
+
+NO_TRADE_REGIMES = {REGIME_SIDEWAYS, "LOW_VOLATILITY"}
 
 
 def _normalize_download(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -228,6 +240,238 @@ def reset_market_data_cache() -> None:
 
     _price_cache.clear()
     _top_movers_cache.clear()
+    _ranked_candidates_cache.clear()
+
+
+def _prepare_prebreakout_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build indicator and feature columns needed for pre-breakout ranking."""
+
+    enriched = create_features(add_indicators(frame))
+    enriched["atr_mean_20"] = enriched["atr"].rolling(window=20).mean()
+    enriched["volatility_expansion"] = enriched["atr"] / enriched["atr_mean_20"]
+    return enriched.dropna(subset=FEATURE_COLUMNS + ["volatility_expansion"])
+
+
+def _train_regime_model_from_frames(frames: dict[str, pd.DataFrame]):
+    """Train a transient regime model from the current watchlist universe."""
+
+    training_frames: list[pd.DataFrame] = []
+    for ticker, frame in frames.items():
+        try:
+            prepared = label_market(_prepare_prebreakout_frame(frame))
+            if not prepared.empty:
+                training_frames.append(prepared)
+        except Exception as exc:
+            logger.info("Skipping %s for transient regime training: %s", ticker, exc)
+
+    if not training_frames:
+        logger.info("No regime training data available for pre-breakout ranking.")
+        return None
+
+    try:
+        return train_model(pd.concat(training_frames, axis=0).sort_index())
+    except Exception as exc:
+        logger.info("Could not train transient regime model for pre-breakout ranking: %s", exc)
+        return None
+
+
+def _normalize_positive(value: float, cap: float) -> float:
+    if cap <= 0:
+        return 0.0
+    return max(0.0, min(value / cap, 1.0))
+
+
+def _score_prebreakout_candidate(
+    *,
+    ticker: str,
+    frame: pd.DataFrame,
+    model,
+    min_price: float,
+    min_avg_volume: float,
+) -> AutoWatchlistCandidateModel | None:
+    try:
+        if frame.empty or len(frame) < 220:
+            logger.info("Rejected %s: insufficient history for EMA200/ATR ranking.", ticker)
+            return None
+
+        prepared = _prepare_prebreakout_frame(frame)
+        if prepared.empty:
+            logger.info("Rejected %s: indicator feature frame is empty.", ticker)
+            return None
+
+        latest = prepared.iloc[-1]
+        price = float(latest["Close"])
+        avg_volume = float(prepared["Volume"].tail(20).mean())
+        current_volume = float(latest["Volume"])
+        trend_strength = float(latest["trend_strength"])
+        volume_ratio = float(latest["volume_ratio"])
+        volatility_expansion = float(latest["volatility_expansion"])
+
+        if price < min_price:
+            logger.info("Rejected %s: price %.2f below minimum %.2f.", ticker, price, min_price)
+            return None
+        if avg_volume < min_avg_volume:
+            logger.info(
+                "Rejected %s: average volume %.2f below minimum %.2f.",
+                ticker,
+                avg_volume,
+                min_avg_volume,
+            )
+            return None
+        if trend_strength <= 0:
+            logger.info("Rejected %s: trend_strength %.4f is not positive.", ticker, trend_strength)
+            return None
+        if volume_ratio <= 1.5:
+            logger.info("Rejected %s: volume_ratio %.2f <= 1.50.", ticker, volume_ratio)
+            return None
+        if volatility_expansion <= 1.2:
+            logger.info(
+                "Rejected %s: volatility_expansion %.2f <= 1.20.",
+                ticker,
+                volatility_expansion,
+            )
+            return None
+        if model is None:
+            logger.info("Rejected %s: regime model unavailable for AI confidence filter.", ticker)
+            return None
+
+        regime, confidence = predict_with_confidence(model, latest)
+        logger.info("Detected regime for %s: %s (confidence %.2f)", ticker, regime, confidence)
+        if confidence < 0.6:
+            logger.info("Rejected %s: confidence %.2f < 0.60.", ticker, confidence)
+            return None
+        if regime in NO_TRADE_REGIMES:
+            logger.info("Rejected %s: no-trade regime %s.", ticker, regime)
+            return None
+
+        prev_close = float(prepared["Close"].iloc[-2])
+        change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+        trend_score = _normalize_positive(trend_strength / price, 0.10)
+        volume_score = _normalize_positive(volume_ratio, 3.0)
+        volatility_score = _normalize_positive(volatility_expansion, 2.0)
+        score = (
+            (trend_score * 0.25)
+            + (volume_score * 0.25)
+            + (volatility_score * 0.2)
+            + (confidence * 0.3)
+        )
+        logger.info(
+            "Ranked %s: score %.4f, regime %s, confidence %.2f, trend %.4f, volume_ratio %.2f, volatility_expansion %.2f.",
+            ticker,
+            score,
+            regime,
+            confidence,
+            trend_strength,
+            volume_ratio,
+            volatility_expansion,
+        )
+
+        return AutoWatchlistCandidateModel(
+            ticker=ticker,
+            price=round(price, 2),
+            change_pct=round(change_pct, 2),
+            avg_volume=round(avg_volume, 2),
+            score=round(score, 4),
+            trend_strength=round(trend_strength, 4),
+            volume_ratio=round(volume_ratio, 4),
+            volatility_expansion=round(volatility_expansion, 4),
+            regime=regime,
+            confidence=round(confidence, 4),
+        )
+    except Exception as exc:
+        logger.warning("Could not rank pre-breakout candidate %s: %s", ticker, exc)
+        return None
+
+
+def _overall_market_allows_trading(
+    *,
+    frames: dict[str, pd.DataFrame],
+    model,
+) -> bool:
+    """Block entries when the broad candidate universe is sideways or low volatility."""
+
+    if model is None:
+        logger.info("No-trade zone active: regime model unavailable.")
+        return False
+
+    latest_rows: list[pd.Series] = []
+    for ticker, frame in frames.items():
+        try:
+            prepared = _prepare_prebreakout_frame(frame)
+            if not prepared.empty:
+                latest_rows.append(prepared.iloc[-1][FEATURE_COLUMNS])
+        except Exception as exc:
+            logger.info("Skipping %s from overall regime check: %s", ticker, exc)
+
+    if not latest_rows:
+        logger.info("No-trade zone active: no usable market features.")
+        return False
+
+    market_row = pd.DataFrame(latest_rows).mean(numeric_only=True)
+    regime, confidence = predict_with_confidence(model, market_row)
+    logger.info("Overall market regime: %s (confidence %.2f)", regime, confidence)
+    if regime in NO_TRADE_REGIMES:
+        logger.info("No-trade zone active: overall market regime is %s.", regime)
+        return False
+    return True
+
+
+def rank_stocks(
+    candidates: list[str] | dict[str, pd.DataFrame],
+    model=None,
+    *,
+    top_n: int | None = 3,
+    min_price: float | None = None,
+    min_avg_volume: float | None = None,
+) -> list[AutoWatchlistCandidateModel]:
+    """Rank pre-breakout candidates using AI regime confidence and quality filters."""
+
+    if not candidates:
+        return []
+
+    if isinstance(candidates, dict):
+        frames = candidates
+        tickers = list(candidates)
+    else:
+        tickers = list(dict.fromkeys(candidates))
+        frames = _download_many_tickers(tickers, period="1y", interval="1d")
+
+    resolved_min_price = min_price if min_price is not None else settings.auto_watchlist_min_price
+    resolved_min_avg_volume = (
+        min_avg_volume if min_avg_volume is not None else settings.auto_watchlist_min_avg_volume
+    )
+    cache_key = (
+        f"rank:{','.join(sorted(tickers))}:{top_n if top_n is not None else 'all'}:"
+        f"{resolved_min_price}:{resolved_min_avg_volume}:{id(model) if model is not None else 'auto'}"
+    )
+    cached = _ranked_candidates_cache.get(cache_key)
+    if cached:
+        cached_at, payload = cached
+        if datetime.now(timezone.utc) - cached_at <= timedelta(seconds=settings.top_movers_cache_seconds):
+            return payload
+
+    regime_model = model or _train_regime_model_from_frames(frames)
+    if not _overall_market_allows_trading(frames=frames, model=regime_model):
+        _ranked_candidates_cache[cache_key] = (datetime.now(timezone.utc), [])
+        return []
+
+    ranked = [
+        candidate
+        for ticker, frame in frames.items()
+        if (
+            candidate := _score_prebreakout_candidate(
+                ticker=ticker,
+                frame=frame,
+                model=regime_model,
+                min_price=resolved_min_price,
+                min_avg_volume=resolved_min_avg_volume,
+            )
+        )
+    ]
+    ranked = sorted(ranked, key=lambda item: item.score, reverse=True)
+    payload = ranked[:top_n] if top_n is not None else ranked
+    _ranked_candidates_cache[cache_key] = (datetime.now(timezone.utc), payload)
+    return payload
 
 
 def analyze_watchlist_candidates(
@@ -235,48 +479,17 @@ def analyze_watchlist_candidates(
     *,
     min_price: float,
     min_avg_volume: float,
+    model=None,
 ) -> list[AutoWatchlistCandidateModel]:
-    """Rank a broader market universe into watchlist candidates."""
+    """Rank a broader market universe into pre-breakout watchlist candidates."""
 
-    if not tickers:
-        return []
-
-    candidates: list[AutoWatchlistCandidateModel] = []
-    frames = _download_many_tickers(tickers, period="3mo", interval="1d")
-    for ticker, frame in frames.items():
-        try:
-            if frame.empty or len(frame) < 20:
-                continue
-
-            closes = frame["Close"].dropna()
-            volumes = frame["Volume"].dropna() if "Volume" in frame.columns else pd.Series(dtype=float)
-            if closes.empty or volumes.empty:
-                continue
-
-            price = float(closes.iloc[-1])
-            avg_volume = float(volumes.tail(20).mean())
-            # if price < min_price or avg_volume < min_avg_volume:
-                # continue
-
-            prev_close = float(closes.iloc[-2])
-            change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
-            trend_pct = ((price - float(closes.iloc[-20])) / float(closes.iloc[-20])) * 100
-            dollar_volume_m = (price * avg_volume) / 1_000_000
-            score = round((abs(change_pct) * 0.4) + (max(trend_pct, 0.0) * 0.3) + (dollar_volume_m * 0.3), 2)
-
-            candidates.append(
-                AutoWatchlistCandidateModel(
-                    ticker=ticker,
-                    price=round(price, 2),
-                    change_pct=round(change_pct, 2),
-                    avg_volume=round(avg_volume, 2),
-                    score=score,
-                )
-            )
-        except Exception as exc:
-            logger.warning("Could not analyze watchlist candidate for %s: %s", ticker, exc)
-
-    return sorted(candidates, key=lambda item: item.score, reverse=True)
+    return rank_stocks(
+        tickers,
+        model=model,
+        top_n=None,
+        min_price=min_price,
+        min_avg_volume=min_avg_volume,
+    )
 
 
 def now_utc() -> datetime:

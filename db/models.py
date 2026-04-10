@@ -35,6 +35,12 @@ class SignalModel(BaseModel):
     atr: float = 0.0
     adx: float = 0.0
     volume_ratio: float = 0.0
+    trend_strength: float = 0.0
+    regime: str = "SIDEWAYS"
+    regime_confidence: float = 0.0
+    strategy_direction: str = "both"
+    strategy_reward_ratio: float = 0.0
+    position_size_multiplier: float = 1.0
     stop_loss: float = 0.0
     target_price: float = 0.0
     rejection_reason: str | None = None
@@ -173,6 +179,12 @@ class AutoWatchlistCandidateModel(BaseModel):
     change_pct: float
     avg_volume: float
     score: float
+    trend_strength: float = 0.0
+    volume_ratio: float = 0.0
+    volatility_expansion: float = 0.0
+    regime: str = ""
+    confidence: float = 0.0
+    rejection_reason: str | None = None
 
 
 class AutoWatchlistResponseModel(BaseModel):

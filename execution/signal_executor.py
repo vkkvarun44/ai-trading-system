@@ -10,6 +10,7 @@ from db.models import SignalModel, TradeModel
 from execution.paper_trader import PaperTradingEngine, Position
 from execution.risk_management import (
     apply_risk_management,
+    daily_loss_limit_reached,
     get_session_trade_count,
     validate_trade,
 )
@@ -51,6 +52,17 @@ class SignalExecutor:
                 self.state.get_trades(),
                 timezone_name=market_profile_manager.get_active_profile().timezone,
             )
+            portfolio = self.engine.get_portfolio({signal.ticker: signal.price})
+            if daily_loss_limit_reached(
+                starting_capital=self.engine.initial_capital,
+                current_equity=portfolio.total_value,
+                settings=self.settings,
+            ):
+                return self._build_skipped_trade(
+                    signal,
+                    action,
+                    f"Daily loss kill switch triggered at {self.settings.daily_loss_limit_pct:.2%}.",
+                )
             reason = validate_trade(
                 signal=signal,
                 current_trade_count=session_trades,
@@ -212,6 +224,7 @@ class SignalExecutor:
         return position.avg_price + stop_distance, position.avg_price - target_distance
 
     def _build_skipped_trade(self, signal: SignalModel, action: str, reason: str) -> TradeModel:
+        logger.info("Rejected %s: %s", signal.ticker, reason)
         return self.engine._build_trade(
             ticker=signal.ticker,
             side=action,
